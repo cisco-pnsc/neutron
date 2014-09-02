@@ -1,3 +1,5 @@
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
 # Copyright 2012 OpenStack Foundation.
 # All Rights Reserved.
 #
@@ -21,7 +23,7 @@ FIREWALL = "FIREWALL"
 VPN = "VPN"
 METERING = "METERING"
 L3_ROUTER_NAT = "L3_ROUTER_NAT"
-
+SERVICEVM = "SERVICEVM"
 
 #maps extension alias to service type
 EXT_TO_SERVICE_MAPPING = {
@@ -30,12 +32,14 @@ EXT_TO_SERVICE_MAPPING = {
     'fwaas': FIREWALL,
     'vpnaas': VPN,
     'metering': METERING,
-    'router': L3_ROUTER_NAT
+    'router': L3_ROUTER_NAT,
+    'servicevm': SERVICEVM,
+    'lbaas-ssl': LOADBALANCER,
 }
 
 # TODO(salvatore-orlando): Move these (or derive them) from conf file
 ALLOWED_SERVICES = [CORE, DUMMY, LOADBALANCER, FIREWALL, VPN, METERING,
-                    L3_ROUTER_NAT]
+                    L3_ROUTER_NAT, SERVICEVM]
 
 COMMON_PREFIXES = {
     CORE: "",
@@ -45,6 +49,7 @@ COMMON_PREFIXES = {
     VPN: "/vpn",
     METERING: "/metering",
     L3_ROUTER_NAT: "",
+    SERVICEVM: "/servicevm",
 }
 
 # Service operation status constants
@@ -78,3 +83,4 @@ TYPE_LOCAL = 'local'
 TYPE_VXLAN = 'vxlan'
 TYPE_VLAN = 'vlan'
 TYPE_NONE = 'none'
+GLOBAL_DEVICE_TEMPLATE_TID = 'global'

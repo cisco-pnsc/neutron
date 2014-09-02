@@ -1,3 +1,5 @@
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
 # Copyright (c) 2012 OpenStack Foundation.
 # All Rights Reserved.
 #
@@ -17,7 +19,7 @@ import netaddr
 import re
 
 from neutron.common import constants
-from neutron.common import exceptions as n_exc
+from neutron.common import exceptions as q_exc
 from neutron.openstack.common import log as logging
 from neutron.openstack.common import uuidutils
 
@@ -72,24 +74,6 @@ def _validate_values(data, valid_values=None):
         return msg
 
 
-def _validate_not_empty_string_or_none(data, max_len=None):
-    if data is not None:
-        return _validate_not_empty_string(data, max_len=max_len)
-
-
-def _validate_not_empty_string(data, max_len=None):
-    msg = _validate_string(data, max_len=max_len)
-    if msg:
-        return msg
-    if not data.strip():
-        return _("'%s' Blank strings are not permitted") % data
-
-
-def _validate_string_or_none(data, max_len=None):
-    if data is not None:
-        return _validate_string(data, max_len=max_len)
-
-
 def _validate_string(data, max_len=None):
     if not isinstance(data, basestring):
         msg = _("'%s' is not a valid string") % data
@@ -106,7 +90,7 @@ def _validate_string(data, max_len=None):
 def _validate_boolean(data, valid_values=None):
     try:
         convert_to_boolean(data)
-    except n_exc.InvalidInput:
+    except q_exc.InvalidInput:
         msg = _("'%s' is not a valid boolean value") % data
         LOG.debug(msg)
         return msg
@@ -146,30 +130,17 @@ def _validate_no_whitespace(data):
     if len(data.split()) > 1:
         msg = _("'%s' contains whitespace") % data
         LOG.debug(msg)
-        raise n_exc.InvalidInput(error_message=msg)
+        raise q_exc.InvalidInput(error_message=msg)
     return data
 
 
 def _validate_mac_address(data, valid_values=None):
-    valid_mac = False
     try:
-        valid_mac = netaddr.valid_mac(_validate_no_whitespace(data))
+        netaddr.EUI(_validate_no_whitespace(data))
     except Exception:
-        pass
-    finally:
-        # TODO(arosen): The code in this file should be refactored
-        # so it catches the correct exceptions. _validate_no_whitespace
-        # raises AttributeError if data is None.
-        if valid_mac is False:
-            msg = _("'%s' is not a valid MAC address") % data
-            LOG.debug(msg)
-            return msg
-
-
-def _validate_mac_address_or_none(data, valid_values=None):
-    if data is None:
-        return
-    return _validate_mac_address(data, valid_values)
+        msg = _("'%s' is not a valid MAC address") % data
+        LOG.debug(msg)
+        return msg
 
 
 def _validate_ip_address(data, valid_values=None):
@@ -296,7 +267,7 @@ def _validate_subnet(data, valid_values=None):
     msg = None
     try:
         net = netaddr.IPNetwork(_validate_no_whitespace(data))
-        if '/' not in data:
+        if ('/' not in data or net.network != net.ip):
             msg = _("'%(data)s' isn't a recognized IP subnet cidr,"
                     " '%(cidr)s' is recommended") % {"data": data,
                                                      "cidr": net.cidr}
@@ -326,12 +297,6 @@ def _validate_subnet_list(data, valid_values=None):
             return msg
 
 
-def _validate_subnet_or_none(data, valid_values=None):
-    if data is None:
-        return
-    return _validate_subnet(data, valid_values)
-
-
 def _validate_regex(data, valid_values=None):
     try:
         if re.match(valid_values, data):
@@ -342,12 +307,6 @@ def _validate_regex(data, valid_values=None):
     msg = _("'%s' is not a valid input") % data
     LOG.debug(msg)
     return msg
-
-
-def _validate_regex_or_none(data, valid_values=None):
-    if data is None:
-        return
-    return _validate_regex(data, valid_values)
 
 
 def _validate_uuid(data, valid_values=None):
@@ -446,6 +405,51 @@ def _validate_dict_or_nodata(data, key_specs=None):
     if data:
         return _validate_dict(data, key_specs)
 
+def _validate_list_item(validator, item):
+    # Find validator function
+    val_func = val_params = None
+    for (k, v) in validator.iteritems():
+        if k.startswith('type:'):
+            # ask forgiveness, not permission
+            try:
+                val_func = validators[k]
+            except KeyError:
+                return _("Validator '%s' does not exist.") % k
+            val_params = v
+            break
+    # Process validation
+    if val_func:
+        return val_func(item, val_params)
+
+
+def _validate_list(data, key_specs=None):
+    if not isinstance(data, list):
+        msg = _("'%s' is not a list") % data
+        LOG.debug(msg)
+        return msg
+    # Do not perform any further validation, if no constraints are supplied
+    if not key_specs:
+        return
+
+    # In case when list is a list of primitives and values should be converted
+    # replace the items with converted items inside the original list
+    conv_func = key_specs.get('convert_to')
+    if (len(data) > 0 and not
+        (isinstance(data[0], list) or (isinstance(data[0], dict))) and
+        conv_func):
+        for index in range(0, len(data)):
+            data[index] = conv_func(data[index])
+
+    for item in data:
+        msg = _validate_list_item(key_specs, item)
+        if msg:
+            return msg
+def _validate_list_or_empty(data, key_specs=None):
+    if data != []:
+        return _validate_list(data, key_specs)
+
+
+
 
 def _validate_non_negative(data, valid_values=None):
     try:
@@ -476,12 +480,7 @@ def convert_to_boolean(data):
         elif data == 1:
             return True
     msg = _("'%s' cannot be converted to boolean") % data
-    raise n_exc.InvalidInput(error_message=msg)
-
-
-def convert_to_boolean_if_not_none(data):
-    if data is not None:
-        return convert_to_boolean(data)
+    raise q_exc.InvalidInput(error_message=msg)
 
 
 def convert_to_int(data):
@@ -489,26 +488,26 @@ def convert_to_int(data):
         return int(data)
     except (ValueError, TypeError):
         msg = _("'%s' is not a integer") % data
-        raise n_exc.InvalidInput(error_message=msg)
+        raise q_exc.InvalidInput(error_message=msg)
 
 
 def convert_kvp_str_to_list(data):
     """Convert a value of the form 'key=value' to ['key', 'value'].
 
-    :raises: n_exc.InvalidInput if any of the strings are malformed
+    :raises: q_exc.InvalidInput if any of the strings are malformed
                                 (e.g. do not contain a key).
     """
     kvp = [x.strip() for x in data.split('=', 1)]
     if len(kvp) == 2 and kvp[0]:
         return kvp
     msg = _("'%s' is not of the form <key>=[value]") % data
-    raise n_exc.InvalidInput(error_message=msg)
+    raise q_exc.InvalidInput(error_message=msg)
 
 
 def convert_kvp_list_to_dict(kvp_list):
     """Convert a list of 'key=value' strings to a dict.
 
-    :raises: n_exc.InvalidInput if any of the strings are malformed
+    :raises: q_exc.InvalidInput if any of the strings are malformed
                                 (e.g. do not contain a key) or if any
                                 of the keys appear more than once.
     """
@@ -556,26 +555,21 @@ validators = {'type:dict': _validate_dict,
               'type:dict_or_none': _validate_dict_or_none,
               'type:dict_or_empty': _validate_dict_or_empty,
               'type:dict_or_nodata': _validate_dict_or_nodata,
+              'type:list': _validate_list,
+              'type:list_or_empty': _validate_list_or_empty,
               'type:fixed_ips': _validate_fixed_ips,
               'type:hostroutes': _validate_hostroutes,
               'type:ip_address': _validate_ip_address,
               'type:ip_address_or_none': _validate_ip_address_or_none,
               'type:ip_pools': _validate_ip_pools,
               'type:mac_address': _validate_mac_address,
-              'type:mac_address_or_none': _validate_mac_address_or_none,
               'type:nameservers': _validate_nameservers,
               'type:non_negative': _validate_non_negative,
               'type:range': _validate_range,
               'type:regex': _validate_regex,
-              'type:regex_or_none': _validate_regex_or_none,
               'type:string': _validate_string,
-              'type:string_or_none': _validate_string_or_none,
-              'type:not_empty_string': _validate_not_empty_string,
-              'type:not_empty_string_or_none':
-              _validate_not_empty_string_or_none,
               'type:subnet': _validate_subnet,
               'type:subnet_list': _validate_subnet_list,
-              'type:subnet_or_none': _validate_subnet_or_none,
               'type:uuid': _validate_uuid,
               'type:uuid_or_none': _validate_uuid_or_none,
               'type:uuid_list': _validate_uuid_list,
@@ -593,7 +587,7 @@ SUBNETS = '%ss' % SUBNET
 # attribute is not required, but will be generated by the plugin
 # if it is not specified.  Particularly, a value of ATTR_NOT_SPECIFIED
 # is different from an attribute that has been specified with a value of
-# None.  For example, if 'gateway_ip' is omitted in a request to
+# None.  For example, if 'gateway_ip' is ommitted in a request to
 # create a subnet, the plugin will receive ATTR_NOT_SPECIFIED
 # and the default gateway_ip will be generated.
 # However, if gateway_ip is specified as None, this means that
@@ -707,7 +701,8 @@ RESOURCE_ATTRIBUTE_MAP = {
                        'default': ATTR_NOT_SPECIFIED,
                        'validate': {'type:ip_address_or_none': None},
                        'is_visible': True},
-        'allocation_pools': {'allow_post': True, 'allow_put': True,
+        #TODO(salvatore-orlando): Enable PUT on allocation_pools
+        'allocation_pools': {'allow_post': True, 'allow_put': False,
                              'default': ATTR_NOT_SPECIFIED,
                              'validate': {'type:ip_pools': None},
                              'is_visible': True},
@@ -729,15 +724,6 @@ RESOURCE_ATTRIBUTE_MAP = {
                         'default': True,
                         'convert_to': convert_to_boolean,
                         'is_visible': True},
-        'ipv6_ra_mode': {'allow_post': True, 'allow_put': True,
-                         'default': ATTR_NOT_SPECIFIED,
-                         'validate': {'type:values': constants.IPV6_MODES},
-                         'is_visible': True},
-        'ipv6_address_mode': {'allow_post': True, 'allow_put': True,
-                              'default': ATTR_NOT_SPECIFIED,
-                              'validate': {'type:values':
-                                           constants.IPV6_MODES},
-                              'is_visible': True},
         SHARED: {'allow_post': False,
                  'allow_put': False,
                  'default': False,

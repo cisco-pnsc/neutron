@@ -1,3 +1,5 @@
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
 # Copyright 2012 OpenStack Foundation.
 # All Rights Reserved.
 #
@@ -25,14 +27,10 @@ from neutron.api.v2 import resource_helper
 from neutron.common import exceptions as qexception
 from neutron import manager
 from neutron.plugins.common import constants
-from neutron.services import service_base
+from neutron.services.service_base import ServicePluginBase
 
 
 # Loadbalancer Exceptions
-class DelayOrTimeoutInvalid(qexception.BadRequest):
-    message = _("Delay must be greater than or equal to timeout")
-
-
 class NoEligibleBackend(qexception.NotFound):
     message = _("No eligible backend for pool %(pool_id)s")
 
@@ -94,8 +92,13 @@ class MemberExists(qexception.NeutronException):
                 "already present in pool %(pool)s")
 
 
+VIPS = 'vips'
+POOLS = 'pools'
+MEMBERS = 'members'
+HEALTH_MONITORS = 'health_monitors'
+
 RESOURCE_ATTRIBUTE_MAP = {
-    'vips': {
+    VIPS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -156,7 +159,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         'status_description': {'allow_post': False, 'allow_put': False,
                                'is_visible': True}
     },
-    'pools': {
+    POOLS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -204,7 +207,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         'status_description': {'allow_post': False, 'allow_put': False,
                                'is_visible': True}
     },
-    'members': {
+    MEMBERS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -237,7 +240,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         'status_description': {'allow_post': False, 'allow_put': False,
                                'is_visible': True}
     },
-    'health_monitors': {
+    HEALTH_MONITORS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -254,7 +257,6 @@ RESOURCE_ATTRIBUTE_MAP = {
                   'convert_to': attr.convert_to_int,
                   'is_visible': True},
         'timeout': {'allow_post': True, 'allow_put': True,
-                    'validate': {'type:non_negative': None},
                     'convert_to': attr.convert_to_int,
                     'is_visible': True},
         'max_retries': {'allow_post': True, 'allow_put': True,
@@ -289,7 +291,7 @@ RESOURCE_ATTRIBUTE_MAP = {
 }
 
 SUB_RESOURCE_ATTRIBUTE_MAP = {
-    'health_monitors': {
+    HEALTH_MONITORS: {
         'parent': {'collection_name': 'pools',
                    'member_name': 'pool'},
         'parameters': {'id': {'allow_post': True, 'allow_put': False,
@@ -348,18 +350,36 @@ class Loadbalancer(extensions.ExtensionDescriptor):
 
     @classmethod
     def get_resources(cls):
-        plural_mappings = resource_helper.build_plural_mappings(
-            {}, RESOURCE_ATTRIBUTE_MAP)
-        plural_mappings['health_monitors_status'] = 'health_monitor_status'
-        attr.PLURALS.update(plural_mappings)
-        action_map = {'pool': {'stats': 'GET'}}
-        resources = resource_helper.build_resource_info(plural_mappings,
-                                                        RESOURCE_ATTRIBUTE_MAP,
-                                                        constants.LOADBALANCER,
-                                                        action_map=action_map,
-                                                        register_quota=True)
+        my_plurals = [(key, key[:-1]) for key in RESOURCE_ATTRIBUTE_MAP.keys()]
+        my_plurals.append(('health_monitors_status', 'health_monitor_status'))
+        attr.PLURALS.update(dict(my_plurals))
+        resources = []
         plugin = manager.NeutronManager.get_service_plugins()[
             constants.LOADBALANCER]
+        for collection_name in RESOURCE_ATTRIBUTE_MAP:
+            # Special handling needed for resources with 'y' ending
+            # (e.g. proxies -> proxy)
+            resource_name = collection_name[:-1]
+            params = RESOURCE_ATTRIBUTE_MAP[collection_name]
+
+            member_actions = {}
+            if resource_name == 'pool':
+                member_actions = {'stats': 'GET'}
+
+            controller = base.create_resource(
+                collection_name, resource_name, plugin, params,
+                member_actions=member_actions,
+                allow_pagination=cfg.CONF.allow_pagination,
+                allow_sorting=cfg.CONF.allow_sorting)
+
+            resource = extensions.ResourceExtension(
+                collection_name,
+                controller,
+                path_prefix=constants.COMMON_PREFIXES[constants.LOADBALANCER],
+                member_actions=member_actions,
+                attr_map=params)
+            resources.append(resource)
+
         for collection_name in SUB_RESOURCE_ATTRIBUTE_MAP:
             # Special handling needed for sub-resources with 'y' ending
             # (e.g. proxies -> proxy)
@@ -397,8 +417,8 @@ class Loadbalancer(extensions.ExtensionDescriptor):
             return {}
 
 
-@six.add_metaclass(abc.ABCMeta)
-class LoadBalancerPluginBase(service_base.ServicePluginBase):
+class LoadBalancerPluginBase(ServicePluginBase):
+    __metaclass__ = abc.ABCMeta
 
     def get_plugin_name(self):
         return constants.LOADBALANCER

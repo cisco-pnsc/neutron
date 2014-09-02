@@ -17,6 +17,7 @@
 from oslo.config import cfg
 
 from neutron.api import extensions
+from neutron.api.v2 import attributes
 from neutron.api.v2 import base
 from neutron import manager
 from neutron.plugins.common import constants
@@ -38,7 +39,7 @@ def build_plural_mappings(special_mappings, resource_map):
 
 
 def build_resource_info(plural_mappings, resource_map, which_service,
-                        action_map=None, register_quota=False,
+                        ext_plugin=None, action_map=None, register_quota=False,
                         translate_name=False, allow_bulk=False):
     """Build resources for advanced services.
 
@@ -52,8 +53,8 @@ def build_resource_info(plural_mappings, resource_map, which_service,
     :param which_service: The name of the service for which the WSGI resources
                           are being created. This name will be used to pass
                           the appropriate plugin to the WSGI resource.
-                          It can be set to None or "CORE" to create WSGI
-                          resources for the core plugin
+                          It can be set to None or "CORE"to create WSGI
+                          resources for the the core plugin
     :param action_map: custom resource actions
     :param register_quota: it can be set to True to register quotas for the
                            resource(s) being created
@@ -65,13 +66,20 @@ def build_resource_info(plural_mappings, resource_map, which_service,
         which_service = constants.CORE
     if action_map is None:
         action_map = {}
-    if which_service != constants.CORE:
+
+    if ext_plugin:
+        plugin = ext_plugin
+    elif which_service != constants.CORE:
         plugin = manager.NeutronManager.get_service_plugins()[which_service]
     else:
         plugin = manager.NeutronManager.get_plugin()
     for collection_name in resource_map:
         resource_name = plural_mappings[collection_name]
         params = resource_map.get(collection_name, {})
+        extended_params = attributes.RESOURCE_ATTRIBUTE_MAP.get(
+            collection_name)
+        if (extended_params):
+            params = extended_params
         if translate_name:
             collection_name = collection_name.replace('_', '-')
         if register_quota:
