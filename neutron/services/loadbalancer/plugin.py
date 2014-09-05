@@ -19,11 +19,16 @@ from neutron.api.v2 import attributes as attrs
 from neutron.common import exceptions as n_exc
 from neutron import context
 from neutron.db import api as qdbapi
+from neutron.db.loadbalancer import lbaas_ssl_db as ssldb
 from neutron.db.loadbalancer import loadbalancer_db as ldb
 from neutron.db import servicetype_db as st_db
+from neutron.extensions import loadbalancer
+from neutron.openstack.common import excutils
 from neutron.openstack.common import log as logging
 from neutron.plugins.common import constants
 from neutron.services.loadbalancer import agent_scheduler
+from neutron.services.loadbalancer.drivers import (
+    abstract_ssl_extension_driver as abs_ssl_driver)
 from neutron.services import provider_configuration as pconf
 from neutron.services import service_base
 
@@ -31,7 +36,8 @@ LOG = logging.getLogger(__name__)
 
 
 class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
-                         agent_scheduler.LbaasAgentSchedulerDbMixin):
+                         agent_scheduler.LbaasAgentSchedulerDbMixin,
+                         ssldb.LBaasSSLDbMixin):
     """Implementation of the Neutron Loadbalancer Service Plugin.
 
     This class manages the workflow of LBaaS request/response.
@@ -40,7 +46,8 @@ class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
     """
     supported_extension_aliases = ["lbaas",
                                    "lbaas_agent_scheduler",
-                                   "service-type"]
+                                   "service-type",
+                                   "lbaas-ssl"]
 
     # lbaas agent notifiers to handle agent update operations;
     # can be updated by plugin drivers while loading;
@@ -80,7 +87,7 @@ class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
             msg = _("Delete associated loadbalancer pools before "
                     "removing providers %s") % list(lost_providers)
             LOG.exception(msg)
-            raise SystemExit(msg)
+            raise SystemExit(1)
 
     def _get_driver_for_provider(self, provider):
         if provider in self.drivers:
@@ -96,6 +103,27 @@ class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
         except KeyError:
             raise n_exc.Invalid(_("Error retrieving provider for pool %s") %
                                 pool_id)
+
+    def _get_driver_for_vip_ssl(self, context, vip_id):
+        vip = self.get_vip(context, vip_id)
+        pool = self.get_pool(context, vip['pool_id'])
+        if pool['provider']:
+            try:
+                driver = self.drivers[pool['provider']]
+                if not issubclass(
+                    driver.__class__,
+                    abs_ssl_driver.LBaaSAbstractSSLDriver
+                ):
+                    raise n_exc.ExtensionNotSupportedByProvider(
+                        extension_name='lbaas-ssl',
+                        provider_name=pool['provider'])
+                return driver
+            except KeyError:
+                raise n_exc.Invalid(_("Error retrieving provider for "
+                                      "vip's %s SSL configuration"), vip_id)
+        else:
+            raise n_exc.Invalid(_("Error retrieving provider for vip %s"),
+                                vip_id)
 
     def get_plugin_type(self):
         return constants.LOADBALANCER
@@ -123,11 +151,114 @@ class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
         super(LoadBalancerPlugin, self).delete_vip(context, id)
 
     def delete_vip(self, context, id):
-        self.update_status(context, ldb.Vip,
+        
+        #mmadhavs
+        #disallow VIP deletion if ssl_policy is associated
+        #self.update_status(context, ldb.Vip,
+        #                  id, constants.PENDING_DELETE)
+        with context.session.begin(subtransactions=True):
+            self.update_status(context, ldb.Vip,
                            id, constants.PENDING_DELETE)
+            self._ensure_vip_delete_conditions(context, id)
+        #mmadhavs
         v = self.get_vip(context, id)
         driver = self._get_driver_for_pool(context, v['pool_id'])
         driver.delete_vip(context, v)
+
+    def update_ssl_policy(self, context, id, ssl_policy):
+        new_policy = super(LoadBalancerPlugin, self).update_ssl_policy(
+            context, id, ssl_policy)
+
+        with context.session.begin(subtransactions=True):
+            qry = context.session.query(
+                ldb.Vip
+            ).filter_by(
+                ssl_policy_id=new_policy['id'])
+
+            for vip in qry:
+                driver = self._get_driver_for_vip_ssl(context, vip['id'])
+                driver.update_ssl_policy(context, new_policy, vip['id'])
+        return new_policy
+
+    def update_ssl_certificate(self, context, id, ssl_certificate):
+        new_cert = super(LoadBalancerPlugin, self).update_ssl_certificate(
+            context, id, ssl_certificate)
+        with context.session.begin(subtransactions=True):
+            qry = context.session.query(
+                ssldb.VipSSLCertificateAssociation
+            ).filter_by(ssl_certificate_id=new_cert['id'])
+            for assoc in qry:
+                driver = self._get_driver_for_vip_ssl(context, assoc['vip_id'])
+                driver.update_ssl_certificate(context, new_cert,
+                                              assoc['vip_id'])
+        return new_cert
+
+    def update_ssl_trusted_certificate(self, context, id,
+                                       ssl_trusted_certificate):
+        new_trusted_cert = super(LoadBalancerPlugin,
+                                 self).update_ssl_trusted_certificate(
+                                     context, id, ssl_trusted_certificate)
+
+        with context.session.begin(subtransactions=True):
+            qry = context.session.query(
+                ssldb.VipSSLTrustedCertificateAssociation
+            ).filter_by(
+                ssl_trusted_certificate_id=new_trusted_cert['id']).join(
+                    ldb.Vip)
+
+            for assoc in qry:
+                driver = self._get_driver_for_vip_ssl(context, assoc['vip_id'])
+                driver.update_ssl_trusted_certificate(context,
+                                                      new_trusted_cert,
+                                                      assoc['vip_id'])
+
+        return new_trusted_cert
+
+    def create_vip_ssl_association(self, context,
+                                   ssl_association, vip_id):
+        res = super(LoadBalancerPlugin, self).create_vip_ssl_association(
+            context, ssl_association, vip_id)
+
+        if ssl_association['ssl_association']['ssl_policy']:
+            policy_id = ssl_association[
+                'ssl_association']['ssl_policy']['id']
+        else:
+            policy_id = None
+
+        cert_ids_keys = dict((cert['id'], cert['private_key'])
+                             for cert in ssl_association[
+                             'ssl_association']['ssl_certificates'])
+        trusted_cert_ids = [
+            cert['id'] for cert in ssl_association[
+                'ssl_association']['ssl_trusted_certificates']]
+
+        ssl_policy = self.get_ssl_policy(context, policy_id)
+        ssl_certificates = self.get_ssl_certificates(
+            context, filters={'id': cert_ids_keys.keys()})
+        ssl_trusted_certificates = self.get_ssl_trusted_certificates(
+            context, filters={'id': trusted_cert_ids}
+        )
+
+        # Append the private keys to certificates
+        for cert in ssl_certificates:
+            cert.update({'private_key': cert_ids_keys[cert['id']]})
+
+        vip = self.get_vip(context, vip_id)
+        driver = self._get_driver_for_vip_ssl(context, vip_id)
+        driver.create_vip_ssl_association(context,
+                                          ssl_policy, ssl_certificates,
+                                          ssl_trusted_certificates, vip)
+
+        return res
+
+    def delete_vip_ssl_association(self, context, id, vip_id):
+        vip = self.get_vip(context, vip_id)
+        driver = self._get_driver_for_vip_ssl(context, vip_id)
+        driver.delete_vip_ssl_association(context, vip)
+
+        res = super(LoadBalancerPlugin, self).delete_vip_ssl_association(
+            context, id, vip_id)
+        return res
 
     def _get_provider_name(self, context, pool):
         if ('provider' in pool and
@@ -153,7 +284,15 @@ class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
         #because provider was not known to db plugin at pool creation
         p['provider'] = provider_name
         driver = self.drivers[provider_name]
-        driver.create_pool(context, p)
+        try:
+            driver.create_pool(context, p)
+        except loadbalancer.NoEligibleBackend:
+            # that should catch cases when backend of any kind
+            # is not available (agent, appliance, etc)
+            self.update_status(context, ldb.Pool,
+                               p['id'], constants.ERROR,
+                               "No eligible backend")
+            raise loadbalancer.NoEligibleBackend(pool_id=p['id'])
         return p
 
     def update_pool(self, context, id, pool):
@@ -168,13 +307,28 @@ class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
     def _delete_db_pool(self, context, id):
         # proxy the call until plugin inherits from DBPlugin
         # rely on uuid uniqueness:
-        with context.session.begin(subtransactions=True):
-            self.service_type_manager.del_resource_associations(context, [id])
-            super(LoadBalancerPlugin, self).delete_pool(context, id)
+        try:
+            with context.session.begin(subtransactions=True):
+                self.service_type_manager.del_resource_associations(
+                    context, [id])
+                super(LoadBalancerPlugin, self).delete_pool(context, id)
+        except Exception:
+            # that should not happen
+            # if it's still a case - something goes wrong
+            # log the error and mark the pool as ERROR
+            LOG.error(_('Failed to delete pool %s, putting it in ERROR state'),
+                      id)
+            with excutils.save_and_reraise_exception():
+                self.update_status(context, ldb.Pool,
+                                   id, constants.ERROR)
 
     def delete_pool(self, context, id):
-        self.update_status(context, ldb.Pool,
-                           id, constants.PENDING_DELETE)
+        # check for delete conditions and update the status
+        # within a transaction to avoid a race
+        with context.session.begin(subtransactions=True):
+            self.update_status(context, ldb.Pool,
+                               id, constants.PENDING_DELETE)
+            self._ensure_pool_delete_conditions(context, id)
         p = self.get_pool(context, id)
         driver = self._get_driver_for_provider(p['provider'])
         driver.delete_pool(context, p)
@@ -226,8 +380,8 @@ class LoadBalancerPlugin(ldb.LoadBalancerPluginDb,
             ).filter_by(monitor_id=hm['id']).join(ldb.Pool)
             for assoc in qry:
                 driver = self._get_driver_for_pool(context, assoc['pool_id'])
-                driver.update_health_monitor(context, old_hm,
-                                             hm, assoc['pool_id'])
+                driver.update_pool_health_monitor(context, old_hm,
+                                                  hm, assoc['pool_id'])
         return hm
 
     def _delete_db_pool_health_monitor(self, context, hm_id, pool_id):

@@ -210,6 +210,12 @@ class CommonDbMixin(object):
             return getattr(self, '_get_%s' % resource)(context, marker)
         return None
 
+    @classmethod
+    def register_dict_extend_funcs(cls, resource, funcs):
+        cur_funcs = cls._dict_extend_functions.get(resource, [])
+        cur_funcs.extend(funcs)
+        cls._dict_extend_functions[resource] = cur_funcs
+
 
 class NeutronDbPluginV2(neutron_plugin_base_v2.NeutronPluginBaseV2,
                         CommonDbMixin):

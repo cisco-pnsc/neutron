@@ -405,6 +405,51 @@ def _validate_dict_or_nodata(data, key_specs=None):
     if data:
         return _validate_dict(data, key_specs)
 
+def _validate_list_item(validator, item):
+    # Find validator function
+    val_func = val_params = None
+    for (k, v) in validator.iteritems():
+        if k.startswith('type:'):
+            # ask forgiveness, not permission
+            try:
+                val_func = validators[k]
+            except KeyError:
+                return _("Validator '%s' does not exist.") % k
+            val_params = v
+            break
+    # Process validation
+    if val_func:
+        return val_func(item, val_params)
+
+
+def _validate_list(data, key_specs=None):
+    if not isinstance(data, list):
+        msg = _("'%s' is not a list") % data
+        LOG.debug(msg)
+        return msg
+    # Do not perform any further validation, if no constraints are supplied
+    if not key_specs:
+        return
+
+    # In case when list is a list of primitives and values should be converted
+    # replace the items with converted items inside the original list
+    conv_func = key_specs.get('convert_to')
+    if (len(data) > 0 and not
+        (isinstance(data[0], list) or (isinstance(data[0], dict))) and
+        conv_func):
+        for index in range(0, len(data)):
+            data[index] = conv_func(data[index])
+
+    for item in data:
+        msg = _validate_list_item(key_specs, item)
+        if msg:
+            return msg
+def _validate_list_or_empty(data, key_specs=None):
+    if data != []:
+        return _validate_list(data, key_specs)
+
+
+
 
 def _validate_non_negative(data, valid_values=None):
     try:
@@ -510,6 +555,8 @@ validators = {'type:dict': _validate_dict,
               'type:dict_or_none': _validate_dict_or_none,
               'type:dict_or_empty': _validate_dict_or_empty,
               'type:dict_or_nodata': _validate_dict_or_nodata,
+              'type:list': _validate_list,
+              'type:list_or_empty': _validate_list_or_empty,
               'type:fixed_ips': _validate_fixed_ips,
               'type:hostroutes': _validate_hostroutes,
               'type:ip_address': _validate_ip_address,

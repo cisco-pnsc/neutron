@@ -310,3 +310,8 @@ class DeviceIDNotOwnedByTenant(Conflict):
 
 class InvalidCIDR(BadRequest):
     message = _("Invalid CIDR %(input)s given as IP prefix")
+
+
+class ExtensionNotSupportedByProvider(NeutronException):
+    message = _("Extension %(extension_name)s is not supported by "
+                " %(provider_name)s provider") 

@@ -18,10 +18,12 @@
 import abc
 
 from oslo.config import cfg
+import six
 
 from neutron.api import extensions
 from neutron.api.v2 import attributes as attr
 from neutron.api.v2 import base
+from neutron.api.v2 import resource_helper
 from neutron.common import exceptions as qexception
 from neutron import manager
 from neutron.plugins.common import constants
@@ -29,6 +31,10 @@ from neutron.services.service_base import ServicePluginBase
 
 
 # Loadbalancer Exceptions
+class NoEligibleBackend(qexception.NotFound):
+    message = _("No eligible backend for pool %(pool_id)s")
+
+
 class VipNotFound(qexception.NotFound):
     message = _("Vip %(vip_id)s could not be found")
 
@@ -67,6 +73,11 @@ class PoolInUse(qexception.InUse):
     message = _("Pool %(pool_id)s is still in use")
 
 
+class HealthMonitorInUse(qexception.InUse):
+    message = _("Health monitor %(monitor_id)s still has associations with "
+                "pools")
+
+
 class PoolStatsNotFound(qexception.NotFound):
     message = _("Statistics of Pool %(pool_id)s could not be found")
 
@@ -76,8 +87,18 @@ class ProtocolMismatch(qexception.BadRequest):
                 "pool protocol %(pool_proto)s")
 
 
+class MemberExists(qexception.NeutronException):
+    message = _("Member with address %(address)s and port %(port)s "
+                "already present in pool %(pool)s")
+
+
+VIPS = 'vips'
+POOLS = 'pools'
+MEMBERS = 'members'
+HEALTH_MONITORS = 'health_monitors'
+
 RESOURCE_ATTRIBUTE_MAP = {
-    'vips': {
+    VIPS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -138,7 +159,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         'status_description': {'allow_post': False, 'allow_put': False,
                                'is_visible': True}
     },
-    'pools': {
+    POOLS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -186,7 +207,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         'status_description': {'allow_post': False, 'allow_put': False,
                                'is_visible': True}
     },
-    'members': {
+    MEMBERS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -219,7 +240,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         'status_description': {'allow_post': False, 'allow_put': False,
                                'is_visible': True}
     },
-    'health_monitors': {
+    HEALTH_MONITORS: {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:uuid': None},
                'is_visible': True,
@@ -270,7 +291,7 @@ RESOURCE_ATTRIBUTE_MAP = {
 }
 
 SUB_RESOURCE_ATTRIBUTE_MAP = {
-    'health_monitors': {
+    HEALTH_MONITORS: {
         'parent': {'collection_name': 'pools',
                    'member_name': 'pool'},
         'parameters': {'id': {'allow_post': True, 'allow_put': False,
@@ -283,6 +304,26 @@ SUB_RESOURCE_ATTRIBUTE_MAP = {
                        }
     }
 }
+
+lbaas_quota_opts = [
+    cfg.IntOpt('quota_vip',
+               default=10,
+               help=_('Number of vips allowed per tenant. '
+                      'A negative value means unlimited.')),
+    cfg.IntOpt('quota_pool',
+               default=10,
+               help=_('Number of pools allowed per tenant. '
+                      'A negative value means unlimited.')),
+    cfg.IntOpt('quota_member',
+               default=-1,
+               help=_('Number of pool members allowed per tenant. '
+                      'A negative value means unlimited.')),
+    cfg.IntOpt('quota_health_monitor',
+               default=-1,
+               help=_('Number of health monitors allowed per tenant. '
+                      'A negative value means unlimited.'))
+]
+cfg.CONF.register_opts(lbaas_quota_opts, 'QUOTAS')
 
 
 class Loadbalancer(extensions.ExtensionDescriptor):

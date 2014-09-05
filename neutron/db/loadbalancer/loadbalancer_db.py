@@ -220,7 +220,7 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
 
     ########################################################
     # VIP DB access
-    def _make_vip_dict(self, vip, fields=None):
+    def _make_vip_dict(self, vip, fields=None, process_extensions=True):
         fixed_ip = (vip.port.fixed_ips or [{}])[0]
 
         res = {'id': vip['id'],
@@ -237,6 +237,10 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                'admin_state_up': vip['admin_state_up'],
                'status': vip['status'],
                'status_description': vip['status_description']}
+
+        if process_extensions:
+            self._apply_dict_extend_functions(
+                loadbalancer.VIPS, res, vip)
 
         if vip['session_persistence']:
             s_p = {
@@ -338,9 +342,15 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                     raise q_exc.NotAuthorized()
                 # validate that the pool has same protocol
                 if pool['protocol'] != v['protocol']:
-                    raise loadbalancer.ProtocolMismatch(
-                        vip_proto=v['protocol'],
-                        pool_proto=pool['protocol'])
+                    #mmadhavs
+                    #SSL extension change:Allow VIP to 
+                    #be HTTP or HTTPS if pool is on HTTP
+                    if (pool['protocol'] != 'HTTP' or
+                        v['protocol'] !='HTTPS'):
+                    #mmadhavs
+                        raise loadbalancer.ProtocolMismatch(
+                            vip_proto=v['protocol'],
+                            pool_proto=pool['protocol'])
             else:
                 pool = None
 
@@ -415,9 +425,15 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                             raise q_exc.NotAuthorized()
                         # validate that the pool has same protocol
                         if new_pool['protocol'] != vip_db['protocol']:
-                            raise loadbalancer.ProtocolMismatch(
-                                vip_proto=vip_db['protocol'],
-                                pool_proto=new_pool['protocol'])
+                            #mmadhavs
+                            #SSL extension change:Allow VIP to 
+                            #be HTTP or HTTPS if pool is on HTTP
+                            if (new_pool['protocol'] != 'HTTP' or
+                                vip_db['protocol'] !='HTTPS'):
+                            #mmadhavs
+                                raise loadbalancer.ProtocolMismatch(
+                                    vip_proto=vip_db['protocol'],
+                                    pool_proto=new_pool['protocol'])
 
                         if old_pool_id:
                             old_pool = self._get_resource(
@@ -498,6 +514,16 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                 stats_status = stats.get(lb_const.STATS_STATUS)
                 if stats_status:
                     self.update_status(context, Member, member, stats_status)
+
+    def _ensure_pool_delete_conditions(self, context, pool_id):
+        if context.session.query(Vip).filter_by(pool_id=pool_id).first():
+            raise loadbalancer.PoolInUse(pool_id=pool_id)
+
+    def _ensure_vip_delete_conditions(self, context, vip_id):
+        vip = self._get_resource(context, Vip, vip_id)
+        if vip['ssl_policy_id'] != None:
+            raise lbaas_ssl.SSLPolicyInUse(
+                policy_id=vip['ssl_policy_id'])
 
     def _create_pool_stats(self, context, pool_id, data=None):
         # This is internal method to add pool statistics. It won't
