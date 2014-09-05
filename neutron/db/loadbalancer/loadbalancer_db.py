@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright 2013 OpenStack Foundation.  All rights reserved
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,21 +13,21 @@
 #    under the License.
 #
 
+from oslo.db import exception
 import sqlalchemy as sa
 from sqlalchemy import orm
 from sqlalchemy.orm import exc
 from sqlalchemy.orm import validates
 
 from neutron.api.v2 import attributes
-from neutron.common import exceptions as q_exc
-from neutron.db import db_base_plugin_v2 as base_db
+from neutron.common import exceptions as n_exc
+from neutron.db import common_db_mixin as base_db
 from neutron.db import model_base
 from neutron.db import models_v2
 from neutron.db import servicetype_db as st_db
 from neutron.extensions import loadbalancer
-from neutron.extensions.loadbalancer import LoadBalancerPluginBase
 from neutron import manager
-from neutron.openstack.common.db import exception
+from neutron.openstack.common import excutils
 from neutron.openstack.common import log as logging
 from neutron.openstack.common import uuidutils
 from neutron.plugins.common import constants
@@ -57,10 +55,10 @@ class PoolStatistics(model_base.BASEV2):
 
     pool_id = sa.Column(sa.String(36), sa.ForeignKey("pools.id"),
                         primary_key=True)
-    bytes_in = sa.Column(sa.Integer, nullable=False)
-    bytes_out = sa.Column(sa.Integer, nullable=False)
-    active_connections = sa.Column(sa.Integer, nullable=False)
-    total_connections = sa.Column(sa.Integer, nullable=False)
+    bytes_in = sa.Column(sa.BigInteger, nullable=False)
+    bytes_out = sa.Column(sa.BigInteger, nullable=False)
+    active_connections = sa.Column(sa.BigInteger, nullable=False)
+    total_connections = sa.Column(sa.BigInteger, nullable=False)
 
     @validates('bytes_in', 'bytes_out',
                'active_connections', 'total_connections')
@@ -97,6 +95,10 @@ class Member(model_base.BASEV2, models_v2.HasId, models_v2.HasTenant,
              models_v2.HasStatusDescription):
     """Represents a v2 neutron loadbalancer member."""
 
+    __table_args__ = (
+        sa.schema.UniqueConstraint('pool_id', 'address', 'protocol_port',
+                                   name='uniq_member0pool_id0address0port'),
+    )
     pool_id = sa.Column(sa.String(36), sa.ForeignKey("pools.id"),
                         nullable=False)
     address = sa.Column(sa.String(64), nullable=False)
@@ -172,7 +174,7 @@ class PoolMonitorAssociation(model_base.BASEV2,
                            primary_key=True)
 
 
-class LoadBalancerPluginDb(LoadBalancerPluginBase,
+class LoadBalancerPluginDb(loadbalancer.LoadBalancerPluginBase,
                            base_db.CommonDbMixin):
     """Wraps loadbalancer with SQLAlchemy models.
 
@@ -187,7 +189,16 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
     def update_status(self, context, model, id, status,
                       status_description=None):
         with context.session.begin(subtransactions=True):
-            v_db = self._get_resource(context, model, id)
+            if issubclass(model, Vip):
+                try:
+                    v_db = (self._model_query(context, model).
+                            filter(model.id == id).
+                            options(orm.noload('port')).
+                            one())
+                except exc.NoResultFound:
+                    raise loadbalancer.VipNotFound(vip_id=id)
+            else:
+                v_db = self._get_resource(context, model, id)
             if v_db.status != status:
                 v_db.status = status
             # update status_description in two cases:
@@ -200,16 +211,16 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
         try:
             r = self._get_by_id(context, model, id)
         except exc.NoResultFound:
-            if issubclass(model, Vip):
-                raise loadbalancer.VipNotFound(vip_id=id)
-            elif issubclass(model, Pool):
-                raise loadbalancer.PoolNotFound(pool_id=id)
-            elif issubclass(model, Member):
-                raise loadbalancer.MemberNotFound(member_id=id)
-            elif issubclass(model, HealthMonitor):
-                raise loadbalancer.HealthMonitorNotFound(monitor_id=id)
-            else:
-                raise
+            with excutils.save_and_reraise_exception(reraise=False) as ctx:
+                if issubclass(model, Vip):
+                    raise loadbalancer.VipNotFound(vip_id=id)
+                elif issubclass(model, Pool):
+                    raise loadbalancer.PoolNotFound(pool_id=id)
+                elif issubclass(model, Member):
+                    raise loadbalancer.MemberNotFound(member_id=id)
+                elif issubclass(model, HealthMonitor):
+                    raise loadbalancer.HealthMonitorNotFound(monitor_id=id)
+                ctx.reraise = True
         return r
 
     def assert_modification_allowed(self, obj):
@@ -220,7 +231,7 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
 
     ########################################################
     # VIP DB access
-    def _make_vip_dict(self, vip, fields=None, process_extensions=True):
+    def _make_vip_dict(self, vip, fields=None):
         fixed_ip = (vip.port.fixed_ips or [{}])[0]
 
         res = {'id': vip['id'],
@@ -233,14 +244,11 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                'protocol_port': vip['protocol_port'],
                'protocol': vip['protocol'],
                'pool_id': vip['pool_id'],
+               'session_persistence': None,
                'connection_limit': vip['connection_limit'],
                'admin_state_up': vip['admin_state_up'],
                'status': vip['status'],
                'status_description': vip['status_description']}
-
-        if process_extensions:
-            self._apply_dict_extend_functions(
-                loadbalancer.VIPS, res, vip)
 
         if vip['session_persistence']:
             s_p = {
@@ -310,25 +318,27 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
             sess_qry.filter_by(vip_id=vip_id).delete()
 
     def _create_port_for_vip(self, context, vip_db, subnet_id, ip_address):
-            # resolve subnet and create port
-            subnet = self._core_plugin.get_subnet(context, subnet_id)
-            fixed_ip = {'subnet_id': subnet['id']}
-            if ip_address and ip_address != attributes.ATTR_NOT_SPECIFIED:
-                fixed_ip['ip_address'] = ip_address
+        # resolve subnet and create port
+        subnet = self._core_plugin.get_subnet(context, subnet_id)
+        fixed_ip = {'subnet_id': subnet['id']}
+        if ip_address and ip_address != attributes.ATTR_NOT_SPECIFIED:
+            fixed_ip['ip_address'] = ip_address
 
-            port_data = {
-                'tenant_id': vip_db.tenant_id,
-                'name': 'vip-' + vip_db.id,
-                'network_id': subnet['network_id'],
-                'mac_address': attributes.ATTR_NOT_SPECIFIED,
-                'admin_state_up': False,
-                'device_id': '',
-                'device_owner': '',
-                'fixed_ips': [fixed_ip]
-            }
+        port_data = {
+            'tenant_id': vip_db.tenant_id,
+            'name': 'vip-' + vip_db.id,
+            'network_id': subnet['network_id'],
+            'mac_address': attributes.ATTR_NOT_SPECIFIED,
+            'admin_state_up': False,
+            'device_id': '',
+            'device_owner': '',
+            'fixed_ips': [fixed_ip]
+        }
 
-            port = self._core_plugin.create_port(context, {'port': port_data})
-            vip_db.port_id = port['id']
+        port = self._core_plugin.create_port(context, {'port': port_data})
+        vip_db.port_id = port['id']
+        # explicitly sync session with db
+        context.session.flush()
 
     def create_vip(self, context, vip):
         v = vip['vip']
@@ -339,18 +349,15 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                 pool = self._get_resource(context, Pool, v['pool_id'])
                 # validate that the pool has same tenant
                 if pool['tenant_id'] != tenant_id:
-                    raise q_exc.NotAuthorized()
+                    raise n_exc.NotAuthorized()
                 # validate that the pool has same protocol
                 if pool['protocol'] != v['protocol']:
-                    #mmadhavs
-                    #SSL extension change:Allow VIP to 
-                    #be HTTP or HTTPS if pool is on HTTP
-                    if (pool['protocol'] != 'HTTP' or
-                        v['protocol'] !='HTTPS'):
-                    #mmadhavs
-                        raise loadbalancer.ProtocolMismatch(
-                            vip_proto=v['protocol'],
-                            pool_proto=pool['protocol'])
+                    raise loadbalancer.ProtocolMismatch(
+                        vip_proto=v['protocol'],
+                        pool_proto=pool['protocol'])
+                if pool['status'] == constants.PENDING_DELETE:
+                    raise loadbalancer.StateInvalid(state=pool['status'],
+                                                    id=pool['id'])
             else:
                 pool = None
 
@@ -379,17 +386,21 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                 context.session.flush()
             except exception.DBDuplicateEntry:
                 raise loadbalancer.VipExists(pool_id=v['pool_id'])
-
-            # create a port to reserve address for IPAM
-            self._create_port_for_vip(
-                context,
-                vip_db,
-                v['subnet_id'],
-                v.get('address')
-            )
-
             if pool:
                 pool['vip_id'] = vip_db['id']
+
+        try:
+            # create a port to reserve address for IPAM
+            # do it outside the transaction to avoid rpc calls
+            self._create_port_for_vip(
+                context, vip_db, v['subnet_id'], v.get('address'))
+        except Exception:
+            # catch any kind of exceptions
+            with excutils.save_and_reraise_exception():
+                context.session.delete(vip_db)
+                if pool:
+                    pool['vip_id'] = None
+                context.session.flush()
 
         return self._make_vip_dict(vip_db)
 
@@ -422,18 +433,16 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
 
                         # check that the pool matches the tenant_id
                         if new_pool['tenant_id'] != vip_db['tenant_id']:
-                            raise q_exc.NotAuthorized()
+                            raise n_exc.NotAuthorized()
                         # validate that the pool has same protocol
                         if new_pool['protocol'] != vip_db['protocol']:
-                            #mmadhavs
-                            #SSL extension change:Allow VIP to 
-                            #be HTTP or HTTPS if pool is on HTTP
-                            if (new_pool['protocol'] != 'HTTP' or
-                                vip_db['protocol'] !='HTTPS'):
-                            #mmadhavs
-                                raise loadbalancer.ProtocolMismatch(
-                                    vip_proto=vip_db['protocol'],
-                                    pool_proto=new_pool['protocol'])
+                            raise loadbalancer.ProtocolMismatch(
+                                vip_proto=vip_db['protocol'],
+                                pool_proto=new_pool['protocol'])
+                        if new_pool['status'] == constants.PENDING_DELETE:
+                            raise loadbalancer.StateInvalid(
+                                state=new_pool['status'],
+                                id=new_pool['id'])
 
                         if old_pool_id:
                             old_pool = self._get_resource(
@@ -457,8 +466,8 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                 pool.update({"vip_id": None})
 
             context.session.delete(vip)
-            if vip.port:  # this is a Neutron port
-                self._core_plugin.delete_port(context, vip.port.id)
+        if vip.port:  # this is a Neutron port
+            self._core_plugin.delete_port(context, vip.port.id)
 
     def get_vip(self, context, id, fields=None):
         vip = self._get_resource(context, Vip, id)
@@ -515,16 +524,6 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
                 if stats_status:
                     self.update_status(context, Member, member, stats_status)
 
-    def _ensure_pool_delete_conditions(self, context, pool_id):
-        if context.session.query(Vip).filter_by(pool_id=pool_id).first():
-            raise loadbalancer.PoolInUse(pool_id=pool_id)
-
-    def _ensure_vip_delete_conditions(self, context, vip_id):
-        vip = self._get_resource(context, Vip, vip_id)
-        if vip['ssl_policy_id'] != None:
-            raise lbaas_ssl.SSLPolicyInUse(
-                policy_id=vip['ssl_policy_id'])
-
     def _create_pool_stats(self, context, pool_id, data=None):
         # This is internal method to add pool statistics. It won't
         # be exposed to API
@@ -579,15 +578,17 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
 
         return self._make_pool_dict(pool_db)
 
-    def delete_pool(self, context, id):
+    def _ensure_pool_delete_conditions(self, context, pool_id):
+        if context.session.query(Vip).filter_by(pool_id=pool_id).first():
+            raise loadbalancer.PoolInUse(pool_id=pool_id)
+
+    def delete_pool(self, context, pool_id):
         # Check if the pool is in use
-        vip = context.session.query(Vip).filter_by(pool_id=id).first()
-        if vip:
-            raise loadbalancer.PoolInUse(pool_id=id)
+        self._ensure_pool_delete_conditions(context, pool_id)
 
         with context.session.begin(subtransactions=True):
-            self._delete_pool_stats(context, id)
-            pool_db = self._get_resource(context, Pool, id)
+            self._delete_pool_stats(context, pool_id)
+            pool_db = self._get_resource(context, Pool, pool_id)
             context.session.delete(pool_db)
 
     def get_pool(self, context, id, fields=None):
@@ -684,31 +685,40 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
         v = member['member']
         tenant_id = self._get_tenant_id_for_create(context, v)
 
-        with context.session.begin(subtransactions=True):
-            # ensuring that pool exists
-            self._get_resource(context, Pool, v['pool_id'])
-
-            member_db = Member(id=uuidutils.generate_uuid(),
-                               tenant_id=tenant_id,
-                               pool_id=v['pool_id'],
-                               address=v['address'],
-                               protocol_port=v['protocol_port'],
-                               weight=v['weight'],
-                               admin_state_up=v['admin_state_up'],
-                               status=constants.PENDING_CREATE)
-            context.session.add(member_db)
-
-        return self._make_member_dict(member_db)
+        try:
+            with context.session.begin(subtransactions=True):
+                # ensuring that pool exists
+                self._get_resource(context, Pool, v['pool_id'])
+                member_db = Member(id=uuidutils.generate_uuid(),
+                                   tenant_id=tenant_id,
+                                   pool_id=v['pool_id'],
+                                   address=v['address'],
+                                   protocol_port=v['protocol_port'],
+                                   weight=v['weight'],
+                                   admin_state_up=v['admin_state_up'],
+                                   status=constants.PENDING_CREATE)
+                context.session.add(member_db)
+                return self._make_member_dict(member_db)
+        except exception.DBDuplicateEntry:
+            raise loadbalancer.MemberExists(
+                address=v['address'],
+                port=v['protocol_port'],
+                pool=v['pool_id'])
 
     def update_member(self, context, id, member):
         v = member['member']
-        with context.session.begin(subtransactions=True):
-            member_db = self._get_resource(context, Member, id)
-            self.assert_modification_allowed(member_db)
-            if v:
-                member_db.update(v)
-
-        return self._make_member_dict(member_db)
+        try:
+            with context.session.begin(subtransactions=True):
+                member_db = self._get_resource(context, Member, id)
+                self.assert_modification_allowed(member_db)
+                if v:
+                    member_db.update(v)
+            return self._make_member_dict(member_db)
+        except exception.DBDuplicateEntry:
+            raise loadbalancer.MemberExists(
+                address=member_db['address'],
+                port=member_db['protocol_port'],
+                pool=member_db['pool_id'])
 
     def delete_member(self, context, id):
         with context.session.begin(subtransactions=True):
@@ -749,7 +759,7 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
         v = health_monitor['health_monitor']
         tenant_id = self._get_tenant_id_for_create(context, v)
         with context.session.begin(subtransactions=True):
-            # setting ACTIVE status sinse healthmon is shared DB object
+            # setting ACTIVE status since healthmon is shared DB object
             monitor_db = HealthMonitor(id=uuidutils.generate_uuid(),
                                        tenant_id=tenant_id,
                                        type=v['type'],
@@ -773,6 +783,15 @@ class LoadBalancerPluginDb(LoadBalancerPluginBase,
         return self._make_health_monitor_dict(monitor_db)
 
     def delete_health_monitor(self, context, id):
+        """Delete health monitor object from DB
+
+        Raises an error if the monitor has associations with pools
+        """
+        query = self._model_query(context, PoolMonitorAssociation)
+        has_associations = query.filter_by(monitor_id=id).first()
+        if has_associations:
+            raise loadbalancer.HealthMonitorInUse(monitor_id=id)
+
         with context.session.begin(subtransactions=True):
             monitor_db = self._get_resource(context, HealthMonitor, id)
             context.session.delete(monitor_db)

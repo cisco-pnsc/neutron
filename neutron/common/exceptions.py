@@ -1,6 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-# Copyright 2011 Nicira Networks, Inc
+# Copyright 2011 VMware, Inc
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,7 +17,7 @@
 Neutron base exception handling.
 """
 
-_FATAL_EXCEPTION_FORMAT_ERRORS = False
+from neutron.openstack.common import excutils
 
 
 class NeutronException(Exception):
@@ -36,14 +34,17 @@ class NeutronException(Exception):
             super(NeutronException, self).__init__(self.message % kwargs)
             self.msg = self.message % kwargs
         except Exception:
-            if _FATAL_EXCEPTION_FORMAT_ERRORS:
-                raise
-            else:
-                # at least get the core message out if something happened
-                super(NeutronException, self).__init__(self.message)
+            with excutils.save_and_reraise_exception() as ctxt:
+                if not self.use_fatal_exceptions():
+                    ctxt.reraise = False
+                    # at least get the core message out if something happened
+                    super(NeutronException, self).__init__(self.message)
 
     def __unicode__(self):
         return unicode(self.msg)
+
+    def use_fatal_exceptions(self):
+        return False
 
 
 class BadRequest(NeutronException):
@@ -93,10 +94,6 @@ class PortNotFoundOnNetwork(NotFound):
 
 class PolicyFileNotFound(NotFound):
     message = _("Policy configuration policy.json could not be found")
-
-
-class PolicyRuleNotFound(NotFound):
-    message = _("Requested rule:%(rule)s cannot be found")
 
 
 class PolicyInitError(NeutronException):
@@ -182,6 +179,11 @@ class NoNetworkAvailable(ResourceExhausted):
                 "No tenant network is available for allocation.")
 
 
+class NoNetworkFoundInMaximumAllowedAttempts(ServiceUnavailable):
+    message = _("Unable to create the network. "
+                "No available network found in maximum allowed attempts.")
+
+
 class SubnetMismatchForPort(BadRequest):
     message = _("Subnet on port %(port_id)s does not match "
                 "the requested subnet %(subnet_id)s")
@@ -232,7 +234,7 @@ class PreexistingDeviceFailure(NeutronException):
 
 
 class SudoRequired(NeutronException):
-    message = _("Sudo priviledge is required to run this command.")
+    message = _("Sudo privilege is required to run this command.")
 
 
 class QuotaResourceUnknown(NotFound):
@@ -259,6 +261,10 @@ class InvalidSharedSetting(Conflict):
 
 class InvalidExtensionEnv(BadRequest):
     message = _("Invalid extension environment: %(reason)s")
+
+
+class ExtensionsNotFound(NotFound):
+    message = _("Extensions not found: %(extensions)s")
 
 
 class InvalidContentType(NeutronException):
@@ -299,8 +305,16 @@ class NetworkVlanRangeError(NeutronException):
         super(NetworkVlanRangeError, self).__init__(**kwargs)
 
 
-class NetworkVxlanPortRangeError(object):
+class NetworkVxlanPortRangeError(NeutronException):
     message = _("Invalid network VXLAN port range: '%(vxlan_range)s'")
+
+
+class VxlanNetworkUnsupported(NeutronException):
+    message = _("VXLAN Network unsupported.")
+
+
+class DuplicatedExtension(NeutronException):
+    message = _("Found duplicate extension: %(alias)s")
 
 
 class DeviceIDNotOwnedByTenant(Conflict):
@@ -310,8 +324,3 @@ class DeviceIDNotOwnedByTenant(Conflict):
 
 class InvalidCIDR(BadRequest):
     message = _("Invalid CIDR %(input)s given as IP prefix")
-
-
-class ExtensionNotSupportedByProvider(NeutronException):
-    message = _("Extension %(extension_name)s is not supported by "
-                " %(provider_name)s provider") 
