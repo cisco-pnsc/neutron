@@ -466,10 +466,14 @@ class LBaasSSLDbMixin(lbaas_ssl.LbaasSSLPluginBase, base_db.CommonDbMixin):
             {'id': assoc['ssl_trusted_certificate_id']} for assoc
             in trust_cert_assocs]
 
+        tenant_id = vip['tenant_id']
+
         x = {'ssl_association': {
                 'ssl_policy': policy,
                 'ssl_certificates': certs,
-                'ssl_trusted_certificates': trust_certs}}
+                'ssl_trusted_certificates': trust_certs},
+             'tenant_id': tenant_id
+            }
         LOG.debug(x)
         return x
 
